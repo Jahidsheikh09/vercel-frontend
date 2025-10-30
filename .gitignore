@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.DS_Store
+Thumbs.db
+
+# root .gitignore
+node_modules/
+client/node_modules/
+server/node_modules/
+.env
+.DS_Store
+dist/
+
