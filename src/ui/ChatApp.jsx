@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { apiGet, apiPost, apiPut } from "../lib/api";
+import { decryptMessage } from "../utils/cryptoUtils";
 
 export default function ChatApp({ socket }) {
   const { user, token, logout, updateProfile } = useAuth();
@@ -948,7 +949,7 @@ export default function ChatApp({ socket }) {
                     </span>
                   </div>
                   <div className="bubble">
-                    {m.content}
+                    {decryptMessage(m.content)}
                     {isMine && (
                       <span
                         style={{ marginLeft: 8, color: "var(--subtext)", fontSize: 12 }}
