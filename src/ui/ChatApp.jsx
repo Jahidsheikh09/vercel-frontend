@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { apiGet, apiPost, apiPut } from "../lib/api";
 
@@ -11,6 +11,8 @@ export default function ChatApp({ socket }) {
   const [input, setInput] = useState("");
   const [presence, setPresence] = useState({});
   const endRef = useRef(null);
+  const activeRef = useRef(null);
+  const userRef = useRef(null);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -22,6 +24,16 @@ export default function ChatApp({ socket }) {
   const [groupName, setGroupName] = useState("");
   const [selectedMembers, setSelectedMembers] = useState([]);
   const [unreadCounts, setUnreadCounts] = useState({}); // chatId -> count
+  const [socketConnected, setSocketConnected] = useState(false);
+  
+  // Keep refs in sync with state
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+  
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   useEffect(() => {
     if (!query) {
@@ -51,8 +63,18 @@ export default function ChatApp({ socket }) {
         // a single object in edge cases — coerce to array to avoid runtime
         // errors where .map/.some are expected.
         if (Array.isArray(data)) {
-          setChats(data);
-          if (data.length > 0 && !active) setActive(data[0]);
+          // Deduplicate chats by ID
+          const uniqueChats = [];
+          const seenIds = new Set();
+          data.forEach((chat) => {
+            const chatId = String(chat.id || chat._id);
+            if (!seenIds.has(chatId)) {
+              seenIds.add(chatId);
+              uniqueChats.push(chat);
+            }
+          });
+          setChats(uniqueChats);
+          if (uniqueChats.length > 0 && !active) setActive(uniqueChats[0]);
         } else if (data) {
           setChats([data]);
           if (!active) setActive(data);
@@ -123,54 +145,170 @@ export default function ChatApp({ socket }) {
   }, [active, showGroupInfo, token]);
 
   useEffect(() => {
-    if (!socket) return;
+    if (!socket) {
+      console.warn("[ChatApp] No socket available");
+      setSocketConnected(false);
+      return;
+    }
 
-    socket.on("connect", () => console.info("[socket] connected", socket.id));
-    socket.on("disconnect", (reason) => console.info("[socket] disconnected", reason));
-    socket.on("connect_error", (err) => console.error("[socket] connect_error", err));
-
+    // Update connection status - check immediately and set state
+    console.log("[ChatApp] Setting up socket event listeners, socket connected:", socket.connected);
+    
+    // Set initial connection status
+    if (socket.connected) {
+      setSocketConnected(true);
+    } else {
+      // If not connected, wait a moment and check again (connection might be in progress)
+      const checkConnection = setTimeout(() => {
+        setSocketConnected(socket.connected);
+      }, 500);
+      
+      // Clean up timeout
+      setTimeout(() => clearTimeout(checkConnection), 2000);
+    }
+    
+    // Define handlers as separate functions to ensure proper cleanup
+    const handleConnect = () => {
+      console.info("[ChatApp] Socket connected", socket.id);
+      setSocketConnected(true);
+    };
+    
+    const handleDisconnect = (reason) => {
+      console.info("[ChatApp] Socket disconnected", reason);
+      setSocketConnected(false);
+    };
+    
+    const handleConnectError = (err) => {
+      console.error("[ChatApp] Socket connection error", err.message || err);
+      setSocketConnected(false);
+      // Check if it's an authentication error
+      if (err.message?.includes("Unauthorized") || err.message?.includes("Authentication")) {
+        console.error("[ChatApp] Authentication failed - token may be invalid");
+        alert("Authentication failed. Please log in again.");
+      }
+    };
+    
+    const handleReconnect = (attemptNumber) => {
+      console.log("[ChatApp] Socket reconnected after", attemptNumber, "attempts");
+      setSocketConnected(true);
+    };
+    
+    const handleReconnectAttempt = (attemptNumber) => {
+      console.log("[ChatApp] Reconnection attempt", attemptNumber);
+    };
+    
+    const handleReconnectFailed = () => {
+      console.error("[ChatApp] Reconnection failed");
+      setSocketConnected(false);
+      alert("Failed to reconnect to server. Please refresh the page.");
+    };
+    
+    // Remove any existing listeners first to prevent duplicates
+    socket.off("connect", handleConnect);
+    socket.off("disconnect", handleDisconnect);
+    socket.off("connect_error", handleConnectError);
+    socket.off("reconnect", handleReconnect);
+    socket.off("reconnect_attempt", handleReconnectAttempt);
+    socket.off("reconnect_failed", handleReconnectFailed);
+    
+    // Add listeners
+    socket.on("connect", handleConnect);
+    socket.on("disconnect", handleDisconnect);
+    socket.on("connect_error", handleConnectError);
+    socket.on("reconnect", handleReconnect);
+    socket.on("reconnect_attempt", handleReconnectAttempt);
+    socket.on("reconnect_failed", handleReconnectFailed);
+    
     function handleNewMessage(message) {
+      console.log("[Frontend] Received message:new event", message);
       const chatId = message.chat || message.chatId;
+      if (!chatId) {
+        console.warn("[Frontend] Message missing chatId", message);
+        return;
+      }
 
-      const isActive = String(chatId) === String(active?.id || active?._id) && !!active;
+      // Use refs to get latest active and user values
+      const currentActive = activeRef.current;
+      const currentUser = userRef.current;
+      const currentActiveChatId = currentActive?.id || currentActive?._id;
+      const isActive = String(chatId) === String(currentActiveChatId) && !!currentActive;
+      
+      // Always add message to active chat if it's the current chat
       if (isActive) {
-          setMessages((prev) => {
-            const list = Array.isArray(prev) ? prev : [];
-            const exists = list.some(
-              (m) => String(m.id || m._id) === String(message.id || message._id)
-            );
-            if (exists) return list;
-            return [...list, message];
-          });
-
-          // If message is from other user, acknowledge delivered and seen
-          if (String(message.sender) !== String(user?.id)) {
-            try {
-              socket.emit("message:delivered", { messageId: message.id || message._id });
-              socket.emit("message:seen", { messageIds: [message.id || message._id] });
-            } catch {}
+        setMessages((prev) => {
+          const list = Array.isArray(prev) ? prev : [];
+          const exists = list.some(
+            (m) => String(m.id || m._id) === String(message.id || message._id)
+          );
+          if (exists) {
+            console.log("[Frontend] Message already exists, skipping duplicate");
+            return list;
           }
+          console.log("[Frontend] Adding message to active chat messages");
+          return [...list, message];
+        });
+
+        // If message is from other user, acknowledge delivered and seen
+        if (socket && socket.connected && String(message.sender) !== String(currentUser?.id)) {
+          try {
+            console.log("[Frontend] Marking message as delivered and seen");
+            socket.emit("message:delivered", { messageId: message.id || message._id });
+            socket.emit("message:seen", { messageIds: [message.id || message._id] });
+          } catch (err) {
+            console.error("[Frontend] Failed to mark message as seen:", err);
+          }
+        }
+      } else {
+        console.log("[Frontend] Message received for inactive chat, will update chat list only");
       }
 
       setChats((prev) => {
         const list = Array.isArray(prev) ? prev : [];
-        const exists = list.some((c) => String(c.id || c._id) === String(chatId));
+        const chatIdStr = String(chatId);
+        const exists = list.some((c) => {
+          const cId = String(c.id || c._id);
+          return cId === chatIdStr;
+        });
+        
         if (exists) {
-          return list.map((c) =>
-            String(c.id || c._id) === String(chatId) ? { ...c, lastMessage: message } : c
-          );
+          // Update existing chat with new lastMessage
+          return list.map((c) => {
+            const cId = String(c.id || c._id);
+            if (cId === chatIdStr) {
+              return { ...c, lastMessage: message };
+            }
+            return c;
+          });
         }
 
         // Chat not found locally — if chatInfo provided, use it immediately; else fetch
         if (message.chatInfo) {
           const chat = { ...message.chatInfo, lastMessage: message };
-          setChats((cur) => (Array.isArray(cur) ? [chat, ...cur] : [chat]));
+          // Double check it doesn't exist (race condition prevention)
+          const alreadyExists = list.some((c) => {
+            const cId = String(c.id || c._id);
+            return cId === String(chat.id || chat._id);
+          });
+          if (!alreadyExists) {
+            return [chat, ...list];
+          }
           return list;
         } else {
           (async () => {
             try {
               const chat = await apiGet(`/api/chats/${chatId}`, token);
-              setChats((cur) => (Array.isArray(cur) ? [chat, ...cur] : [chat]));
+              setChats((cur) => {
+                const currentList = Array.isArray(cur) ? cur : [];
+                const chatIdStr2 = String(chat.id || chat._id);
+                const exists2 = currentList.some((c) => {
+                  const cId = String(c.id || c._id);
+                  return cId === chatIdStr2;
+                });
+                if (!exists2) {
+                  return [chat, ...currentList];
+                }
+                return currentList;
+              });
             } catch (err) {
               console.error("Failed to fetch chat for incoming message:", err);
             }
@@ -180,7 +318,7 @@ export default function ChatApp({ socket }) {
       });
 
       // Increment unread count if message not for active chat or not focused on it
-      if (!isActive && String(message.sender) !== String(user?.id)) {
+      if (!isActive && String(message.sender) !== String(currentUser?.id)) {
         setUnreadCounts((prev) => {
           const id = String(chatId);
           const next = { ...prev };
@@ -202,10 +340,23 @@ export default function ChatApp({ socket }) {
     socket.on("message:new", handleNewMessage);
     socket.on("chat:created", (chat) => {
       if (!chat) return;
+      console.log("[Frontend] Received chat:created event", chat);
       setChats((prev) => {
         const list = Array.isArray(prev) ? prev : [];
-        const exists = list.some((c) => String(c.id || c._id) === String(chat.id || chat._id));
-        if (exists) return list;
+        const chatIdStr = String(chat.id || chat._id);
+        const exists = list.some((c) => {
+          const cId = String(c.id || c._id);
+          return cId === chatIdStr;
+        });
+        if (exists) {
+          console.log("[Frontend] Chat already exists, updating instead of adding");
+          // Update existing chat instead of duplicating
+          return list.map((c) => {
+            const cId = String(c.id || c._id);
+            return cId === chatIdStr ? { ...chat } : c;
+          });
+        }
+        console.log("[Frontend] Adding new chat to list");
         return [chat, ...list];
       });
       try { socket.emit("chat:join", chat.id || chat._id); } catch {}
@@ -255,27 +406,78 @@ export default function ChatApp({ socket }) {
     });
 
     return () => {
-      socket.off("message:new", handleNewMessage);
-      socket.off("typing", handleTypingEvent);
-      socket.off("message:status");
-      socket.off("chat:created");
-      socket.off("user:presence");
-      socket.off("connect");
-      socket.off("disconnect");
-      socket.off("connect_error");
+      console.log("[ChatApp] Cleaning up socket event listeners");
+      if (socket) {
+        // Remove listeners using the handler functions
+        socket.off("message:new", handleNewMessage);
+        socket.off("typing", handleTypingEvent);
+        socket.off("message:status");
+        socket.off("chat:created");
+        socket.off("user:presence");
+        socket.off("connect", handleConnect);
+        socket.off("disconnect", handleDisconnect);
+        socket.off("connect_error", handleConnectError);
+        socket.off("reconnect", handleReconnect);
+        socket.off("reconnect_attempt", handleReconnectAttempt);
+        socket.off("reconnect_failed", handleReconnectFailed);
+      }
     };
-  }, [socket, active]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [socket]); // Only re-run when socket instance changes
 
   async function send(e) {
     e?.preventDefault();
-    console.log("Sending message 1");
-    if (!active || !input.trim()) return;
+    if (!active || !input.trim()) {
+      console.warn("[Frontend] Cannot send: missing active chat or input");
+      return;
+    }
+    
+    if (!socket) {
+      console.error("[Frontend] Socket not initialized");
+      alert("Socket not initialized. Please refresh the page.");
+      return;
+    }
+    
+    // Check socket connection status - use socket.connected directly
+    if (!socket.connected) {
+      console.warn("[Frontend] Socket not connected, attempting to reconnect...");
+      // Try to manually connect if not already connecting
+      if (!socket.connecting && !socket.disconnected) {
+        socket.connect();
+      }
+      // Wait a bit for connection (with timeout)
+      const maxWait = 5000; // 5 seconds
+      const checkInterval = 200; // Check every 200ms
+      let waited = 0;
+      
+      while (!socket.connected && waited < maxWait) {
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+        waited += checkInterval;
+        if (socket.connected) {
+          console.log("[Frontend] Socket connected after waiting");
+          setSocketConnected(true);
+          break;
+        }
+      }
+      
+      if (!socket.connected) {
+        console.error("[Frontend] Socket still not connected after waiting");
+        setSocketConnected(false);
+        alert("Not connected to server. Please check your connection and refresh the page.");
+        return;
+      }
+    }
+
+    console.log("[Frontend] Sending message:", { chatId: active.id || active._id, content: input.trim() });
     const tempId = `temp-${Date.now()}`;
+    const chatId = active.id || active._id;
+    const messageContent = input.trim();
+    
     const optimisticMsg = {
       id: tempId,
-      chat: active.id || active._id,
+      chat: chatId,
       sender: user.id,
-      content: input.trim(),
+      content: messageContent,
       createdAt: new Date().toISOString(),
       status: { [user.id]: "sent" },
       optimistic: true,
@@ -283,42 +485,47 @@ export default function ChatApp({ socket }) {
     setMessages((prev) => [...prev, optimisticMsg]);
     setInput("");
 
-    console.log("Sending message 2");
     try {
       socket.emit(
         "message:send",
         {
-          chatId: active.id || active._id,
-          content: optimisticMsg.content,
+          chatId: chatId,
+          content: messageContent,
         },
         (ack) => {
-          console.log("sending message");
+          console.log("[Frontend] Received ack from server:", ack);
           if (ack && ack.ok && ack.message) {
+            console.log("[Frontend] Message sent successfully, updating with real message");
             setMessages((prev) => {
               const list = Array.isArray(prev) ? prev : [];
               const realId = ack.message.id || ack.message._id;
               const already = list.some((m) => String(m.id || m._id) === String(realId));
               if (already) {
+                // Remove optimistic message if real message already exists
                 return list.filter((m) => m.id !== tempId);
               }
+              // Replace optimistic message with real one
               return list.map((m) => (m.id === tempId ? ack.message : m));
             });
-            // Sender optimistically sets status 'sent'; receiver will push delivered/seen
           } else if (ack && ack.error) {
+            console.error("[Frontend] Message send failed:", ack.error);
             setMessages((prev) => {
               const list = Array.isArray(prev) ? prev : [];
               return list.filter((m) => m.id !== tempId);
             });
             alert("Message failed: " + ack.error);
+          } else {
+            console.warn("[Frontend] Unexpected ack format:", ack);
           }
         }
       );
     } catch (err) {
+      console.error("[Frontend] Exception while sending message:", err);
       setMessages((prev) => {
         const list = Array.isArray(prev) ? prev : [];
         return list.filter((m) => m.id !== tempId);
       });
-      console.error("Failed to send message:", err);
+      alert("Failed to send message. Please try again.");
     }
   }
 
@@ -356,7 +563,19 @@ export default function ChatApp({ socket }) {
         { memberIds: [userId], isGroup: false },
         token
       );
-      setChats((prev) => (Array.isArray(prev) ? [chat, ...prev] : [chat]));
+      setChats((prev) => {
+        const list = Array.isArray(prev) ? prev : [];
+        const chatIdStr = String(chat.id || chat._id);
+        // Check if chat already exists to prevent duplicates
+        const exists = list.some((c) => {
+          const cId = String(c.id || c._id);
+          return cId === chatIdStr;
+        });
+        if (exists) {
+          return list;
+        }
+        return [chat, ...list];
+      });
       setActive(chat);
       try { socket?.emit("chat:join", chat.id || chat._id); } catch {}
       setQuery("");
@@ -378,7 +597,19 @@ export default function ChatApp({ socket }) {
         },
         token
       );
-      setChats((prev) => (Array.isArray(prev) ? [chat, ...prev] : [chat]));
+      setChats((prev) => {
+        const list = Array.isArray(prev) ? prev : [];
+        const chatIdStr = String(chat.id || chat._id);
+        // Check if chat already exists to prevent duplicates
+        const exists = list.some((c) => {
+          const cId = String(c.id || c._id);
+          return cId === chatIdStr;
+        });
+        if (exists) {
+          return list;
+        }
+        return [chat, ...list];
+      });
       setActive(chat);
       try { socket?.emit("chat:join", chat.id || chat._id); } catch {}
       setQuery("");
@@ -492,7 +723,19 @@ export default function ChatApp({ socket }) {
               alignItems: "center",
             }}
           >
-            <span>{user?.name || user?.username || "User"}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span>{user?.name || user?.username || "User"}</span>
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  background: socket?.connected ? "#00a884" : "#f66",
+                  display: "inline-block",
+                }}
+                title={socket?.connected ? "Connected" : "Disconnected"}
+              />
+            </div>
             <div>
               <button
                 onClick={() => {
@@ -632,17 +875,26 @@ export default function ChatApp({ socket }) {
                 No chats yet. Search for users to start a conversation.
               </li>
             ) : (
-              safeChats.map((c, i) => (
-                <li
-                  key={c.id || c._id || c.name || i}
-                  onClick={() => setActive(c)}
-                  className={active?.id === (c.id || c._id) ? "self" : ""}
-                  style={{ cursor: "pointer" }}
-                >
-                  {getChatTitle(c)} {c.typing ? "…typing" : ""}
-                  {renderUnread(c)}
-                </li>
-              ))
+              safeChats
+                .filter((c, index, self) => {
+                  // Remove duplicates by ID
+                  const chatId = String(c.id || c._id);
+                  return index === self.findIndex((chat) => String(chat.id || chat._id) === chatId);
+                })
+                .map((c) => {
+                  const chatId = String(c.id || c._id);
+                  return (
+                    <li
+                      key={chatId}
+                      onClick={() => setActive(c)}
+                      className={active?.id === (c.id || c._id) ? "self" : ""}
+                      style={{ cursor: "pointer" }}
+                    >
+                      {getChatTitle(c)} {c.typing ? "…typing" : ""}
+                      {renderUnread(c)}
+                    </li>
+                  );
+                })
             )}
           </ul>
         </div>
@@ -721,16 +973,34 @@ export default function ChatApp({ socket }) {
               value={input}
               onChange={(e) => {
                 setInput(e.target.value);
-                if (socket) {
+                if (socket && socket.connected) {
                   socket.emit("typing", {
                     chatId: active.id || active._id,
                     typing: true,
                   });
                 }
               }}
-              placeholder="Type a message"
+              placeholder={socket?.connected ? "Type a message" : "Connecting..."}
+              disabled={!socket || !socket.connected}
             />
-            <button type="submit">Send</button>
+            <button type="submit" disabled={!socket || !socket.connected || !input.trim()}>
+              {socket?.connected ? "Send" : "Connecting..."}
+            </button>
+            {socket && !socket.connected && (
+              <div style={{ 
+                position: "absolute", 
+                bottom: "100%", 
+                left: 0, 
+                right: 0, 
+                padding: "4px 8px", 
+                background: "#f66", 
+                color: "white", 
+                fontSize: "12px",
+                textAlign: "center"
+              }}>
+                Not connected to server. Attempting to reconnect...
+              </div>
+            )}
           </form>
         )}
         {active?.isGroup && showGroupInfo && (
