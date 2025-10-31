@@ -268,6 +268,7 @@ export default function ChatApp({ socket }) {
 
   async function send(e) {
     e?.preventDefault();
+    console.log("Sending message 1");
     if (!active || !input.trim()) return;
     const tempId = `temp-${Date.now()}`;
     const optimisticMsg = {
@@ -281,6 +282,8 @@ export default function ChatApp({ socket }) {
     };
     setMessages((prev) => [...prev, optimisticMsg]);
     setInput("");
+
+    console.log("Sending message 2");
     try {
       socket.emit(
         "message:send",
@@ -289,6 +292,7 @@ export default function ChatApp({ socket }) {
           content: optimisticMsg.content,
         },
         (ack) => {
+          console.log("sending message");
           if (ack && ack.ok && ack.message) {
             setMessages((prev) => {
               const list = Array.isArray(prev) ? prev : [];
